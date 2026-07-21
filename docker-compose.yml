@@ -21,10 +21,6 @@ services:
       start_period: 10s
     networks:
       - appnet
-    # Local dev only: run migrations once db1 is healthy, e.g.
-    #   docker compose exec app1 npx prisma migrate deploy
-    # In production, DATABASE_URL comes from AWS Secrets Manager on the
-    # deploy host (see Jenkinsfile) — this env var is ONLY used locally.
 
   db1:
     image: postgres:16-alpine
@@ -43,56 +39,9 @@ services:
       retries: 5
     networks:
       - appnet
-    # NOTE: this container is for LOCAL DEV PARITY ONLY.
-    # Production uses a managed RDS instance, per task requirements.
+    
 
-  # ------------------------------------------------------------------
-  # Application 2 — Multi-Auth (MERN + Prisma)
-  # ------------------------------------------------------------------
-  app2:
-    build:
-      context: ./app2          # path to your cloned/forked Multi-Auth repo
-      dockerfile: Dockerfile
-    container_name: app2_multi_auth
-    restart: unless-stopped
-    env_file:
-      - ./app2/.env
-    environment:
-      - DATABASE_URL=postgresql://${APP2_DB_USER}:${APP2_DB_PASS}@db2:5432/${APP2_DB_NAME}
-      - PORT=4000
-    ports:
-      - "4000:4000"
-    depends_on:
-      db2:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:4000/health"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    networks:
-      - appnet
-    # Run this once after db2 is up, on first boot and whenever schema changes:
-    #   docker-compose exec app2 npx prisma migrate deploy
-
-  db2:
-    image: postgres:16-alpine
-    container_name: app2_db
-    restart: unless-stopped
-    environment:
-      - POSTGRES_USER=${APP2_DB_USER}
-      - POSTGRES_PASSWORD=${APP2_DB_PASS}
-      - POSTGRES_DB=${APP2_DB_NAME}
-    volumes:
-      - app2_db_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${APP2_DB_USER} -d ${APP2_DB_NAME}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - appnet
+ 
 networks:
   appnet:
     driver: bridge
