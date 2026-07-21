@@ -1,83 +1,131 @@
-// Jenkinsfile - App 1 (Todos CRUD API)
-// Pipeline: build -> test -> deploy -> health check -> rollback on failure
-//
-// Rollback strategy: before deploying the new version, we tag the currently
-// running commit as "last-known-good" via a marker file on the server.
-// If the post-deploy health check fails, we git reset to that commit,
-// reinstall, and restart PM2 - no manual SSH required.
-
 pipeline {
     agent any
 
     environment {
-        APP_DIR        = '/opt/apps/todos-api'
-        PM2_NAME       = 'todos-api'
-        HEALTH_URL     = 'http://localhost:3001/health'
-        HEALTH_RETRIES = '5'
-        HEALTH_DELAY   = '3'   // seconds between retries
+        IMAGE          = "ghcr.io/prem7443/todos-api"
+        DEPLOY_HOST    = "100.48.135.152"
+        DEPLOY_USER    = "ubuntu"
+        SECRET_ID      = "apps/todos-api/db-url"
+        CONTAINER_NAME = "todos-api"
+        APP_PORT       = "3001"
+        LASTGOOD_FILE  = "/opt/apps/todos-api.lastgood"
+        HEALTH_URL     = "http://localhost:3001/health"
+        HEALTH_RETRIES = "5"
+        HEALTH_DELAY   = "3"
     }
 
     stages {
-        stage('Build') {
+
+        stage('Checkout') {
             steps {
-                sh '''
-                    npm ci
-                    npx prisma generate
-                '''
+                checkout scm
+                script {
+                    env.GIT_SHA = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    env.IMAGE_TAG = "${IMAGE}:${GIT_SHA}"
+                }
+                echo "Building ${env.IMAGE_TAG}"
             }
         }
 
         stage('Test') {
             steps {
-                sh 'npm test'
+                sh '''
+                    docker run --rm -v "$WORKSPACE":/app -w /app node:20-slim \
+                        sh -c "npm ci && npm test"
+                '''
             }
         }
 
-        stage('Record Last-Known-Good') {
+        stage('Build Image') {
             steps {
-                // Capture current deployed commit on the server before we overwrite it,
-                // so rollback has something concrete to return to.
-                sh '''
-                    ssh -o StrictHostKeyChecking=no deploy@$DEPLOY_HOST \
-                        "cd $APP_DIR && git rev-parse HEAD > /opt/apps/todos-api-last-good.txt || true"
-                '''
+                sh "docker build -t ${IMAGE_TAG} -t ${IMAGE}:latest ."
+            }
+        }
+
+        stage('Push to GHCR') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'ghcr-creds',
+                    usernameVariable: 'GHCR_USER',
+                    passwordVariable: 'GHCR_PAT'
+                )]) {
+                    sh '''
+                        echo "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+                        docker push ${IMAGE_TAG}
+                        docker push ${IMAGE}:latest
+                    '''
+                }
+            }
+        }
+
+        stage('Run Migrations') {
+            steps {
+                sshagent(credentials: ['deploy-ssh-key']) {
+                    sh '''
+                        ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} "
+                            set -e
+                            DB_URL=\\$(aws secretsmanager get-secret-value --secret-id ${SECRET_ID} --query SecretString --output text)
+                            docker pull ${IMAGE_TAG}
+                            docker run --rm -e DATABASE_URL=\\"\\$DB_URL\\" ${IMAGE_TAG} npx prisma migrate deploy
+                        "
+                    '''
+                }
             }
         }
 
         stage('Deploy') {
             steps {
-                sh '''
-                    ssh -o StrictHostKeyChecking=no deploy@$DEPLOY_HOST "
-                        set -e
-                        cd $APP_DIR
-                        git fetch origin main
-                        git reset --hard origin/main
-                        npm ci --omit=dev
-                        npx prisma migrate deploy
-                        pm2 reload $PM2_NAME --update-env || pm2 start src/index.js --name $PM2_NAME
-                    "
-                '''
+                sshagent(credentials: ['deploy-ssh-key']) {
+                    sh '''
+                        ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} "
+                            set -e
+                            DB_URL=\\$(aws secretsmanager get-secret-value --secret-id ${SECRET_ID} --query SecretString --output text)
+                            docker stop ${CONTAINER_NAME} || true
+                            docker rm ${CONTAINER_NAME} || true
+                            docker run -d --name ${CONTAINER_NAME} --restart unless-stopped \\
+                                -e DATABASE_URL=\\"\\$DB_URL\\" \\
+                                -p ${APP_PORT}:${APP_PORT} \\
+                                ${IMAGE_TAG}
+                        "
+                    '''
+                }
             }
         }
 
         stage('Post-Deploy Health Check') {
             steps {
-                script {
-                    def healthy = false
-                    for (int i = 0; i < env.HEALTH_RETRIES.toInteger(); i++) {
-                        def status = sh(
-                            script: "curl -s -o /dev/null -w '%{http_code}' $HEALTH_URL || true",
-                            returnStdout: true
-                        ).trim()
-                        if (status == '200') {
-                            healthy = true
-                            break
+                sshagent(credentials: ['deploy-ssh-key']) {
+                    script {
+                        def healthy = false
+                        for (int i = 0; i < env.HEALTH_RETRIES.toInteger(); i++) {
+                            def status = sh(
+                                script: """
+                                    ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} \
+                                        "curl -s -o /dev/null -w '%{http_code}' ${HEALTH_URL}" || true
+                                """,
+                                returnStdout: true
+                            ).trim()
+                            if (status == '200') {
+                                healthy = true
+                                break
+                            }
+                            sleep(env.HEALTH_DELAY.toInteger())
                         }
-                        sleep(env.HEALTH_DELAY.toInteger())
+                        if (!healthy) {
+                            error("Health check failed after ${env.HEALTH_RETRIES} attempts (non-200 response, or no response) - triggering rollback")
+                        }
                     }
-                    if (!healthy) {
-                        error("Health check failed after ${env.HEALTH_RETRIES} attempts - triggering rollback")
-                    }
+                }
+            }
+        }
+
+        stage('Record Last-Known-Good') {
+            steps {
+                sshagent(credentials: ['deploy-ssh-key']) {
+                    sh '''
+                        ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} \
+                            "echo ${GIT_SHA} > ${LASTGOOD_FILE}"
+                    '''
                 }
             }
         }
@@ -85,20 +133,29 @@ pipeline {
 
     post {
         failure {
-            echo 'Deploy failed health check - rolling back to last known-good commit.'
-            sh '''
-                ssh -o StrictHostKeyChecking=no deploy@$DEPLOY_HOST "
-                    set -e
-                    cd $APP_DIR
-                    LAST_GOOD=\\$(cat /opt/apps/todos-api-last-good.txt)
-                    git reset --hard \\$LAST_GOOD
-                    npm ci --omit=dev
-                    pm2 reload $PM2_NAME --update-env
-                "
-            '''
+            echo 'Deploy failed health check - rolling back to last known-good image tag.'
+            sshagent(credentials: ['deploy-ssh-key']) {
+                sh '''
+                    ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} "
+                        set -e
+                        if [ -f ${LASTGOOD_FILE} ]; then
+                            LAST_GOOD=\\$(cat ${LASTGOOD_FILE})
+                            DB_URL=\\$(aws secretsmanager get-secret-value --secret-id ${SECRET_ID} --query SecretString --output text)
+                            docker stop ${CONTAINER_NAME} || true
+                            docker rm ${CONTAINER_NAME} || true
+                            docker run -d --name ${CONTAINER_NAME} --restart unless-stopped \\
+                                -e DATABASE_URL=\\"\\$DB_URL\\" \\
+                                -p ${APP_PORT}:${APP_PORT} \\
+                                ${IMAGE}:\\$LAST_GOOD
+                        else
+                            echo 'No last-known-good tag recorded yet - nothing to roll back to.'
+                        fi
+                    "
+                '''
+            }
         }
         success {
-            echo 'Deploy succeeded and passed health check.'
+            echo "Deploy succeeded and passed health check. Live tag: ${env.GIT_SHA}"
         }
     }
 }
