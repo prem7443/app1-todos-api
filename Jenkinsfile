@@ -69,7 +69,6 @@ pipeline {
                         passwordVariable: 'GHCR_PAT'
                     )
                 ]) {
-
                     sh '''
                     echo "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
@@ -82,47 +81,38 @@ pipeline {
 
         stage('Run Prisma Migration') {
             steps {
-
                 sshagent(credentials: ['deploy-ssh-key']) {
-
-                    sh '''
-                    ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} "
-
+                    sh """
+                    ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} '
                         set -e
 
-                        DB_URL=$(aws secretsmanager get-secret-value \
-                          --secret-id ${SECRET_ID} \
-                          --query SecretString \
+                        DB_URL=\$(aws secretsmanager get-secret-value \\
+                          --secret-id ${SECRET_ID} \\
+                          --query SecretString \\
                           --output text)
 
                         docker pull ${IMAGE_TAG}
 
-                        docker run --rm \
-                          -e DATABASE_URL=\\"$DB_URL\\" \
-                          ${IMAGE_TAG} \
+                        docker run --rm \\
+                          -e DATABASE_URL="\$DB_URL" \\
+                          ${IMAGE_TAG} \\
                           npx prisma migrate deploy
-                    "
-                    '''
-
+                    '
+                    """
                 }
-
             }
         }
 
         stage('Deploy') {
-
             steps {
-
                 sshagent(credentials: ['deploy-ssh-key']) {
-
-                    sh '''
-                    ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} "
-
+                    sh """
+                    ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} '
                         set -e
 
-                        DB_URL=$(aws secretsmanager get-secret-value \
-                          --secret-id ${SECRET_ID} \
-                          --query SecretString \
+                        DB_URL=\$(aws secretsmanager get-secret-value \\
+                          --secret-id ${SECRET_ID} \\
+                          --query SecretString \\
                           --output text)
 
                         docker stop ${CONTAINER_NAME} || true
@@ -130,37 +120,33 @@ pipeline {
 
                         docker pull ${IMAGE_TAG}
 
-                        docker run -d \
-                            --name ${CONTAINER_NAME} \
-                            --restart unless-stopped \
-                            -e DATABASE_URL=\\"$DB_URL\\" \
-                            -e PORT=${APP_PORT} \
-                            -p ${APP_PORT}:${APP_PORT} \
+                        docker run -d \\
+                            --name ${CONTAINER_NAME} \\
+                            --restart unless-stopped \\
+                            -e DATABASE_URL="\$DB_URL" \\
+                            -e PORT=${APP_PORT} \\
+                            -p ${APP_PORT}:${APP_PORT} \\
                             ${IMAGE_TAG}
-                    "
-                    '''
+                    '
+                    """
                 }
             }
         }
 
         stage('Health Check') {
-
             steps {
-
                 sshagent(credentials: ['deploy-ssh-key']) {
-
                     script {
-
                         def healthy = false
 
                         for (int i = 0; i < env.HEALTH_RETRIES.toInteger(); i++) {
 
                             def status = sh(
-                                    script: """
-                                    ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} \
-                                    "curl -s -o /dev/null -w '%{http_code}' ${HEALTH_URL}" || true
-                                    """,
-                                    returnStdout: true
+                                script: """
+                                ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} \
+                                "curl -s -o /dev/null -w '%{http_code}' ${HEALTH_URL}" || true
+                                """,
+                                returnStdout: true
                             ).trim()
 
                             if (status == "200") {
@@ -174,76 +160,65 @@ pipeline {
                         if (!healthy) {
                             error("Health check failed")
                         }
-
                     }
-
                 }
-
             }
-
         }
 
         stage('Save Last Good Version') {
             steps {
-
                 sshagent(credentials: ['deploy-ssh-key']) {
-
-                    sh '''
-                    ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} "
-                    mkdir -p /opt/apps
-                    echo ${VERSION} > ${LASTGOOD_FILE}
-                    "
-                    '''
-
+                    sh """
+                    ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} '
+                        mkdir -p /opt/apps
+                        echo ${VERSION} > ${LASTGOOD_FILE}
+                    '
+                    """
                 }
-
             }
         }
-
     }
 
     post {
-
         failure {
-
             echo "Deployment failed. Rolling back..."
 
             sshagent(credentials: ['deploy-ssh-key']) {
-
-                sh '''
-                ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} "
-
+                sh """
+                ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} '
                     set -e
 
-                    if [ -f ${LASTGOOD_FILE} ]; then
+                    if [ -s "${LASTGOOD_FILE}" ]; then
+                        LAST_GOOD=\$(cat "${LASTGOOD_FILE}" | tr -d " \t\n\r")
 
-                        LAST_GOOD=$(cat ${LASTGOOD_FILE})
+                        if [ -n "\$LAST_GOOD" ]; then
+                            echo "Rolling back to version: \$LAST_GOOD"
 
-                        DB_URL=$(aws secretsmanager get-secret-value \
-                          --secret-id ${SECRET_ID} \
-                          --query SecretString \
-                          --output text)
+                            DB_URL=\$(aws secretsmanager get-secret-value \\
+                              --secret-id ${SECRET_ID} \\
+                              --query SecretString \\
+                              --output text)
 
-                        docker stop ${CONTAINER_NAME} || true
-                        docker rm ${CONTAINER_NAME} || true
+                            docker stop ${CONTAINER_NAME} || true
+                            docker rm ${CONTAINER_NAME} || true
 
-                        docker pull ${IMAGE}:$LAST_GOOD
+                            docker pull ${IMAGE}:\$LAST_GOOD
 
-                        docker run -d \
-                            --name ${CONTAINER_NAME} \
-                            --restart unless-stopped \
-                            -e DATABASE_URL=\\"$DB_URL\\" \
-                            -e PORT=${APP_PORT} \
-                            -p ${APP_PORT}:${APP_PORT} \
-                            ${IMAGE}:$LAST_GOOD
-
+                            docker run -d \\
+                                --name ${CONTAINER_NAME} \\
+                                --restart unless-stopped \\
+                                -e DATABASE_URL="\$DB_URL" \\
+                                -e PORT=${APP_PORT} \\
+                                -p ${APP_PORT}:${APP_PORT} \\
+                                ${IMAGE}:\$LAST_GOOD
+                        else
+                            echo "Rollback file is empty."
+                        fi
                     else
-
                         echo "No rollback version found."
-
                     fi
-                "
-                '''
+                '
+                """
             }
         }
 
