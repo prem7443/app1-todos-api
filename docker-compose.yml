@@ -1,22 +1,29 @@
+version: "3.9"
+
 services:
   app:
-    image: ghcr.io/prem7443/todos-api:v1
+    image: ghcr.io/prem7443/todos-api:latest
     container_name: todos-api
     restart: unless-stopped
+
     environment:
-      - DATABASE_URL=postgresql://${APP1_DB_USER}:${APP1_DB_PASS}@db:5432/${APP1_DB_NAME}
-      - PORT=3001
+      DATABASE_URL: postgresql://${APP1_DB_USER}:${APP1_DB_PASS}@db:5432/${APP1_DB_NAME}
+      PORT: 3001
+
     ports:
       - "3001:3001"
+
     depends_on:
       db:
         condition: service_healthy
+
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 10s
+
     networks:
       - appnet
 
@@ -24,23 +31,26 @@ services:
     image: postgres:16-alpine
     container_name: app1_db
     restart: unless-stopped
+
     environment:
-      - POSTGRES_USER=${APP1_DB_USER}
-      - POSTGRES_PASSWORD=${APP1_DB_PASS}
-      - POSTGRES_DB=${APP1_DB_NAME}
+      POSTGRES_USER: ${APP1_DB_USER}
+      POSTGRES_PASSWORD: ${APP1_DB_PASS}
+      POSTGRES_DB: ${APP1_DB_NAME}
+
     volumes:
       - app1_db_data:/var/lib/postgresql/data
+
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${APP1_DB_USER} -d ${APP1_DB_NAME}"]
       interval: 10s
       timeout: 5s
       retries: 5
+
     networks:
       - appnet
 
 networks:
   appnet:
-    driver: bridge
 
 volumes:
   app1_db_data:
