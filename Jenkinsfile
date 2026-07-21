@@ -1,6 +1,10 @@
 pipeline {
     agent any
 
+    triggers {
+        pollSCM('* * * * *')
+    }
+
     environment {
         IMAGE          = "ghcr.io/prem7443/todos-api"
         DEPLOY_HOST    = "100.48.135.152"
