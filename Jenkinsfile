@@ -31,7 +31,7 @@ pipeline {
             steps {
                 sh '''
                     docker run --rm -v "$WORKSPACE":/app -w /app node:20-slim \
-                        sh -c "npm ci && npm test"
+                        sh -c "npm install && npm test"
                 '''
             }
         }
