@@ -12,6 +12,7 @@ pipeline {
         DEPLOY_USER = "ubuntu"
 
         SECRET_ID = "apps/todos-api/db-url"
+        AWS_REGION = "us-east-1"
 
         CONTAINER_NAME = "todos-api"
         APP_PORT = "3001"
@@ -52,11 +53,11 @@ pipeline {
 
         stage('Build Image') {
             steps {
-                sh """
+                sh '''
                 docker build \
-                  -t ${IMAGE_TAG} \
-                  -t ${IMAGE}:latest .
-                """
+                  -t "$IMAGE_TAG" \
+                  -t "$IMAGE:latest" .
+                '''
             }
         }
 
@@ -72,8 +73,8 @@ pipeline {
                     sh '''
                     echo "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
-                    docker push ${IMAGE_TAG}
-                    docker push ${IMAGE}:latest
+                    docker push "$IMAGE_TAG"
+                    docker push "$IMAGE:latest"
                     '''
                 }
             }
@@ -83,52 +84,54 @@ pipeline {
             steps {
                 sshagent(credentials: ['deploy-ssh-key']) {
                     sh """
-                    ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} '
-                        set -e
+                    cat << 'CMD_EOF' | base64 -w 0 | ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} 'base64 -d | bash'
+set -e
+DB_URL=\$(aws secretsmanager get-secret-value --secret-id ${SECRET_ID} --query SecretString --output text)
 
-                        DB_URL=\$(aws secretsmanager get-secret-value \\
-                          --secret-id ${SECRET_ID} \\
-                          --query SecretString \\
-                          --output text)
-
-                        docker pull ${IMAGE_TAG}
-
-                        docker run --rm \\
-                          -e DATABASE_URL="\$DB_URL" \\
-                          ${IMAGE_TAG} \\
-                          npx prisma migrate deploy
-                    '
+docker pull ${IMAGE_TAG}
+docker run --rm -e DATABASE_URL="\$DB_URL" ${IMAGE_TAG} npx prisma migrate deploy
+CMD_EOF
                     """
                 }
             }
         }
 
-        stage('Deploy') {
+        stage('Deploy with Docker Compose') {
             steps {
-                sshagent(credentials: ['deploy-ssh-key']) {
-                    sh """
-                    ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} '
-                        set -e
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'ghcr-creds',
+                        usernameVariable: 'GHCR_USER',
+                        passwordVariable: 'GHCR_PAT'
+                    )
+                ]) {
+                    sshagent(credentials: ['deploy-ssh-key']) {
+                        // Ensure remote dir exists, then push docker-compose.yml
+                        // from the Jenkins workspace to the deploy host.
+                        sh """
+                        ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} 'mkdir -p /opt/apps/todos-api'
+                        scp -o StrictHostKeyChecking=no docker-compose.yml ${DEPLOY_USER}@${DEPLOY_HOST}:/opt/apps/todos-api/docker-compose.yml
+                        """
 
-                        DB_URL=\$(aws secretsmanager get-secret-value \\
-                          --secret-id ${SECRET_ID} \\
-                          --query SecretString \\
-                          --output text)
+                        sh """
+                        cat << 'CMD_EOF' | base64 -w 0 | ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} 'base64 -d | bash'
+set -e
+cd /opt/apps/todos-api
 
-                        docker stop ${CONTAINER_NAME} || true
-                        docker rm ${CONTAINER_NAME} || true
+RAW_SECRET=\$(aws secretsmanager get-secret-value --secret-id ${SECRET_ID} --region ${AWS_REGION} --query SecretString --output text)
+DB_URL=\$(echo "\$RAW_SECRET" | jq -r .DATABASE_URL 2>/dev/null || echo "\$RAW_SECRET")
 
-                        docker pull ${IMAGE_TAG}
+echo "DATABASE_URL=\$DB_URL" > .env
+echo "PORT=${APP_PORT}" >> .env
 
-                        docker run -d \\
-                            --name ${CONTAINER_NAME} \\
-                            --restart unless-stopped \\
-                            -e DATABASE_URL="\$DB_URL" \\
-                            -e PORT=${APP_PORT} \\
-                            -p ${APP_PORT}:${APP_PORT} \\
-                            ${IMAGE_TAG}
-                    '
-                    """
+sed -i "s|image: ${IMAGE}:.*|image: ${IMAGE_TAG}|g" docker-compose.yml
+
+echo "${GHCR_PAT}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin
+docker compose pull todos-api
+docker compose up -d --remove-orphans
+CMD_EOF
+                        """
+                    }
                 }
             }
         }
@@ -158,7 +161,7 @@ pipeline {
                         }
 
                         if (!healthy) {
-                            error("Health check failed")
+                            error("Health check failed for todos-api service.")
                         }
                     }
                 }
@@ -169,10 +172,10 @@ pipeline {
             steps {
                 sshagent(credentials: ['deploy-ssh-key']) {
                     sh """
-                    ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} '
-                        mkdir -p /opt/apps
-                        echo ${VERSION} > ${LASTGOOD_FILE}
-                    '
+                    cat << 'CMD_EOF' | base64 -w 0 | ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} 'base64 -d | bash'
+mkdir -p /opt/apps
+echo "${VERSION}" > ${LASTGOOD_FILE}
+CMD_EOF
                     """
                 }
             }
@@ -181,49 +184,36 @@ pipeline {
 
     post {
         failure {
-            echo "Deployment failed. Rolling back..."
+            echo "Deployment failed. Attempting rollback..."
 
-            sshagent(credentials: ['deploy-ssh-key']) {
-                sh """
-                ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} '
-                    set -e
+            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE') {
+                sshagent(credentials: ['deploy-ssh-key']) {
+                    sh """
+                    cat << 'CMD_EOF' | base64 -w 0 | ssh -o StrictHostKeyChecking=no ${DEPLOY_USER}@${DEPLOY_HOST} 'base64 -d | bash'
+set -e
+if [ -s "${LASTGOOD_FILE}" ]; then
+    LAST_GOOD=\$(cat "${LASTGOOD_FILE}" | tr -d " \t\n\r")
 
-                    if [ -s "${LASTGOOD_FILE}" ]; then
-                        LAST_GOOD=\$(cat "${LASTGOOD_FILE}" | tr -d " \t\n\r")
-
-                        if [ -n "\$LAST_GOOD" ]; then
-                            echo "Rolling back to version: \$LAST_GOOD"
-
-                            DB_URL=\$(aws secretsmanager get-secret-value \\
-                              --secret-id ${SECRET_ID} \\
-                              --query SecretString \\
-                              --output text)
-
-                            docker stop ${CONTAINER_NAME} || true
-                            docker rm ${CONTAINER_NAME} || true
-
-                            docker pull ${IMAGE}:\$LAST_GOOD
-
-                            docker run -d \\
-                                --name ${CONTAINER_NAME} \\
-                                --restart unless-stopped \\
-                                -e DATABASE_URL="\$DB_URL" \\
-                                -e PORT=${APP_PORT} \\
-                                -p ${APP_PORT}:${APP_PORT} \\
-                                ${IMAGE}:\$LAST_GOOD
-                        else
-                            echo "Rollback file is empty."
-                        fi
-                    else
-                        echo "No rollback version found."
-                    fi
-                '
-                """
+    if [ -n "\$LAST_GOOD" ]; then
+        echo "Rolling back todos-api to version: \$LAST_GOOD"
+        cd /opt/apps/todos-api
+        sed -i "s|image: ${IMAGE}:.*|image: ${IMAGE}:\$LAST_GOOD|g" docker-compose.yml
+        docker compose pull todos-api
+        docker compose up -d todos-api
+    else
+        echo "Rollback file is empty. Skipping rollback."
+    fi
+else
+    echo "No rollback version recorded."
+fi
+CMD_EOF
+                    """
+                }
             }
         }
 
         success {
-            echo "Deployment successful: ${env.VERSION}"
+            echo "Successfully deployed todos-api version: ${env.VERSION}"
         }
     }
 }
